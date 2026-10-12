@@ -460,3 +460,40 @@ def test_conflicting_balance_correction_avoids_double_counting():
     assert data["balances_changed"] is False
     assert data["proposal_created"] is False
     assert data["transaction_created"] is False
+
+
+def test_currency_amount_followup_continues_balance_correction():
+    e = FinanceEngine()
+    before_balances = dict(e.state["balances"])
+    before_proposals = set(e.state["proposals"])
+    before_transactions = len(e.state["transactions"])
+
+    first = e.agent(
+        "My balance is SGD 1,800. Actually, 1,300 is in MYR. "
+        "Can I cover a SGD 1,500 bill?"
+    )
+    assert first["data"]["balance_correction"]["corrected_balance"] == {
+        "amount": 1300.0,
+        "currency": "MYR",
+    }
+
+    followup = e.agent("myr 1300")
+    data = followup["data"]
+
+    assert data["balance_correction"]["is_follow_up"] is True
+    assert data["balance_correction"]["corrected_balance"] == {
+        "amount": 1300.0,
+        "currency": "MYR",
+    }
+    assert data["bill"] == {"amount": 1500.0, "currency": "SGD"}
+    assert data["can_cover"] is False
+    assert data["shortfall_sgd"] == pytest.approx(1081.40)
+    assert "not add the two amounts together" in followup["answer"]
+    assert "not enough" in followup["answer"].lower()
+
+    assert e.state["balances"] == before_balances
+    assert set(e.state["proposals"]) == before_proposals
+    assert len(e.state["transactions"]) == before_transactions
+    assert data["balances_changed"] is False
+    assert data["proposal_created"] is False
+    assert data["transaction_created"] is False

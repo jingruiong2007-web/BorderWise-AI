@@ -47,6 +47,154 @@ class LocalAgentPlanner:
 
 
 
+
+
+
+
+    def _handle_balance_correction_followup(
+        self, text: str
+    ) -> dict[str, Any] | None:
+        """Handle a short currency-amount follow-up to the last correction."""
+        context = getattr(
+            self.engine, "_last_balance_correction_context", None
+        )
+        if not isinstance(context, dict):
+            return None
+
+        t = text.lower().strip()
+        match = re.fullmatch(
+            r"(?:(myr|rm|sgd|s\$)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)|"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)\s*"
+            r"(myr|rm|sgd|s\$))",
+            t,
+        )
+
+        # Treat this context as a one-turn follow-up, not permanent memory.
+        self.engine._last_balance_correction_context = None
+
+        if match is None:
+            return None
+
+        currency_token = (match.group(1) or match.group(4)).lower()
+        amount_text = match.group(2) or match.group(3)
+        currency = (
+            "MYR" if currency_token in {"myr", "rm"} else "SGD"
+        )
+
+        # A follow-up must use the same currency as the corrected balance.
+        if currency != context.get("corrected_currency"):
+            return None
+
+        amount = self.engine.money_value(amount_text.replace(",", ""))
+        bill_amount = self.engine.money_value(context["bill_amount"])
+
+        fx = None
+        rate = Decimal("1")
+        if currency == "MYR":
+            fx = self.engine.refresh_fx()
+            rate = Decimal(str(fx["rate"]))
+
+        balance_sgd = self.engine.money_value(amount * rate)
+        shortfall = self.engine.money_value(
+            max(Decimal("0"), bill_amount - balance_sgd)
+        )
+        can_cover = balance_sgd >= bill_amount
+
+        corrected_label = f"{currency} {amount:,.2f}"
+        previous = context.get("previous_statement")
+        previous_label = (
+            f"{previous['currency']} {previous['amount']:,.2f}"
+            if previous else "the earlier balance statement"
+        )
+
+        if currency == "MYR":
+            conversion_note = (
+                f"At the current reference rate of "
+                f"1 MYR = S${rate:.6f}, {corrected_label} is "
+                f"approximately S${balance_sgd:,.2f}."
+            )
+        else:
+            conversion_note = (
+                f"The corrected balance is S${balance_sgd:,.2f}."
+            )
+
+        if can_cover:
+            verdict = (
+                f"That is enough to cover the S${bill_amount:,.2f} bill."
+            )
+        else:
+            verdict = (
+                f"That is not enough to cover the S${bill_amount:,.2f} "
+                f"bill. The indicative shortfall is S${shortfall:,.2f}."
+            )
+
+        answer = (
+            f"Understood — I’ll use {corrected_label} as the corrected "
+            f"balance for your previous question. It replaces "
+            f"{previous_label}; I will not add the two amounts together. "
+            f"{conversion_note} {verdict} This remains a hypothetical "
+            "assessment. No account balances were changed and no proposal "
+            "or transaction was created."
+        )
+
+        trace = [
+            {
+                "step": "UNDERSTAND",
+                "status": "completed",
+                "detail": (
+                    "Recognized a currency-amount follow-up to the prior "
+                    "balance correction."
+                ),
+            },
+            {
+                "step": "FX" if fx is not None else "REASON",
+                "status": "completed",
+                "detail": (
+                    f"Used corrected balance {corrected_label}; "
+                    f"indicative SGD value S${balance_sgd:,.2f}."
+                ),
+            },
+            {
+                "step": "RECOMMEND",
+                "status": "completed",
+                "detail": (
+                    "Answered the previous bill question without changing "
+                    "balances or creating a transaction."
+                ),
+            },
+        ]
+
+        data = {
+            "balance_correction": {
+                "previous_statement": previous,
+                "corrected_balance": {
+                    "amount": float(amount),
+                    "currency": currency,
+                },
+                "is_follow_up": True,
+            },
+            "bill": {
+                "amount": float(bill_amount),
+                "currency": "SGD",
+            },
+            "fx": fx,
+            "converted_balance_sgd": float(balance_sgd),
+            "shortfall_sgd": float(shortfall),
+            "can_cover": can_cover,
+            "balances_changed": False,
+            "proposal_created": False,
+            "transaction_created": False,
+        }
+
+
+        return self._result("agentic_local", answer, trace, data)
+
+
+
+
+
+
     def _handle_balance_correction(self, text: str) -> dict[str, Any] | None:
         """Handle a corrected balance as a hypothetical scenario, without
         changing account balances or creating a transaction.
@@ -237,6 +385,13 @@ class LocalAgentPlanner:
             "transaction_created": False,
         }
 
+        self.engine._last_balance_correction_context = {
+            "previous_statement": previous_statement,
+            "corrected_currency": corrected_currency,
+            "corrected_amount": float(corrected_amount),
+            "bill_amount": float(bill_amount),
+        }
+
         return self._result("agentic_local", answer, trace, data)
 
 
@@ -260,15 +415,34 @@ class LocalAgentPlanner:
     def run(self, text: str) -> dict[str, Any] | None:
         t = text.lower().strip()
 
+        followup_result = self._handle_balance_correction_followup(t)
+        if followup_result is not None:
+         return followup_result
+
         correction_result = self._handle_balance_correction(t)
         if correction_result is not None:
-            return correction_result
-        myr = self._amount(t, "MYR")
-        sgd = self._amount(t, "SGD")
+          return correction_result
 
         received = any(k in t for k in ["received", "got", "got paid", "family sent", "sent me", "allowance", "incoming"])
         tuition_context = any(k in t for k in ["tuition", "school fees", "fees", "accommodation", "hostel"])
         conversion_question = any(k in t for k in ["convert", "exchange", "should i", "what should i do", "enough", "need to"])
+
+        myr_match = re.search(
+            r"\b(?:rm|myr)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            t,
+        )
+        myr = (
+            self.engine.money_value(myr_match.group(1).replace(",", ""))
+            if myr_match
+            else None
+        )
+
+
+
+
+
+
+
 
         # Explicit execution requests are handled before informational FX questions.
         # An execution command may NEVER create a new proposal or reuse an already
