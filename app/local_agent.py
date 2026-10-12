@@ -45,8 +45,224 @@ class LocalAgentPlanner:
         }
 
 
+
+
+    def _handle_balance_correction(self, text: str) -> dict[str, Any] | None:
+        """Handle a corrected balance as a hypothetical scenario, without
+        changing account balances or creating a transaction.
+        """
+        t = text.lower().strip()
+
+        if "actually" not in t or not any(
+            word in t for word in ["bill", "payment", "cover", "pay"]
+        ):
+            return None
+
+        before_correction, correction_text = t.split("actually", 1)
+
+        # Normalize "1,300 is in MYR" to "MYR 1,300".
+        correction_text = re.sub(
+            r"(?P<amount>[0-9][0-9,]*(?:\.[0-9]+)?)"
+            r"\s+(?:is\s+)?in\s+(?P<currency>myr|sgd)\b",
+            lambda m: f"{m.group('currency')} {m.group('amount')}",
+            correction_text,
+        )
+
+        corrected = re.search(
+            r"\b(?P<currency>myr|sgd)\s*"
+            r"(?P<amount>[0-9][0-9,]*(?:\.[0-9]+)?)\b",
+            correction_text,
+        )
+
+        bill = re.search(
+            r"\b(?:cover|pay|afford)\s+(?:a\s+)?(?:sgd|s\$)\s*"
+            r"(?P<amount>[0-9][0-9,]*(?:\.[0-9]+)?)",
+            t,
+        )
+
+        if corrected is None or bill is None:
+            return None
+
+        corrected_currency = corrected.group("currency").upper()
+        corrected_amount = self.engine.money_value(
+            corrected.group("amount").replace(",", "")
+        )
+        bill_amount = self.engine.money_value(
+            bill.group("amount").replace(",", "")
+        )
+
+        # Capture the earlier statement for auditability, but do not add it
+        # to the corrected amount.
+        previous = re.search(
+            r"\b(?P<currency>myr|sgd)\s*"
+            r"(?P<amount>[0-9][0-9,]*(?:\.[0-9]+)?)\b",
+            before_correction,
+        )
+
+        previous_statement = None
+        if previous:
+            previous_statement = {
+                "amount": float(
+                    self.engine.money_value(
+                        previous.group("amount").replace(",", "")
+                    )
+                ),
+                "currency": previous.group("currency").upper(),
+                "superseded": True,
+            }
+
+        fx = None
+        rate = Decimal("1")
+
+        if corrected_currency == "MYR":
+            fx = self.engine.refresh_fx()
+            rate = Decimal(str(fx["rate"]))
+
+        balance_sgd = self.engine.money_value(corrected_amount * rate)
+        shortfall_sgd = self.engine.money_value(
+            max(Decimal("0"), bill_amount - balance_sgd)
+        )
+        can_cover = balance_sgd >= bill_amount
+
+        corrected_label = (
+            f"{corrected_currency} {corrected_amount:,.2f}"
+        )
+
+        if previous_statement:
+            previous_label = (
+                f"{previous_statement['currency']} "
+                f"{previous_statement['amount']:,.2f}"
+            )
+            correction_note = (
+                f"I treated 'Actually' as a correction. "
+                f"{corrected_label} replaces the earlier "
+                f"{previous_label} statement; I am not adding them together."
+            )
+        else:
+            correction_note = (
+                f"I am using the corrected balance of {corrected_label}."
+            )
+
+        if corrected_currency == "MYR":
+            conversion_note = (
+                f"At the current reference rate of 1 MYR = "
+                f"S${rate:.6f}, {corrected_label} is approximately "
+                f"S${balance_sgd:,.2f}."
+            )
+        else:
+            conversion_note = (
+                f"The corrected SGD balance is S${balance_sgd:,.2f}."
+            )
+
+        if can_cover:
+            verdict = (
+                f"That amount is enough to cover the S${bill_amount:,.2f} bill."
+            )
+        else:
+            verdict = (
+                f"That amount is not enough to cover the "
+                f"S${bill_amount:,.2f} bill. The indicative shortfall is "
+                f"S${shortfall_sgd:,.2f}."
+            )
+
+        answer = (
+            f"{correction_note} {conversion_note} {verdict} "
+            "This is a hypothetical assessment only. I have not changed "
+            "your account balances or created a proposal or transaction."
+        )
+
+        trace = [
+            {
+                "step": "UNDERSTAND",
+                "status": "completed",
+                "detail": (
+                    "Detected a balance correction. The later statement "
+                    "supersedes the earlier amount rather than adding to it."
+                ),
+            },
+            {
+                "step": "OBSERVE",
+                "status": "completed",
+                "detail": f"Using corrected balance: {corrected_label}.",
+            },
+        ]
+
+        if fx is not None:
+            trace.append({
+                "step": "FX",
+                "status": "completed",
+                "detail": (
+                    f"Used the current MYR/SGD reference rate {rate:.6f}."
+                ),
+            })
+
+        trace.extend([
+            {
+                "step": "REASON",
+                "status": "completed",
+                "detail": (
+                    f"Corrected balance value: S${balance_sgd:,.2f}; "
+                    f"bill: S${bill_amount:,.2f}; "
+                    f"can cover: {can_cover}."
+                ),
+            },
+            {
+                "step": "RECOMMEND",
+                "status": "completed",
+                "detail": (
+                    "Provided advice only. No account balance or "
+                    "transaction was changed."
+                ),
+            },
+        ])
+
+        data = {
+            "balance_correction": {
+                "previous_statement": previous_statement,
+                "corrected_balance": {
+                    "amount": float(corrected_amount),
+                    "currency": corrected_currency,
+                },
+            },
+            "bill": {
+                "amount": float(bill_amount),
+                "currency": "SGD",
+            },
+            "fx": fx,
+            "converted_balance_sgd": float(balance_sgd),
+            "shortfall_sgd": float(shortfall_sgd),
+            "can_cover": can_cover,
+            "balances_changed": False,
+            "proposal_created": False,
+            "transaction_created": False,
+        }
+
+        return self._result("agentic_local", answer, trace, data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def run(self, text: str) -> dict[str, Any] | None:
         t = text.lower().strip()
+
+        correction_result = self._handle_balance_correction(t)
+        if correction_result is not None:
+            return correction_result
         myr = self._amount(t, "MYR")
         sgd = self._amount(t, "SGD")
 
